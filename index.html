@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Blaster Swing</title>
+<style>
+  :root{
+    --bg:#06070b;
+    --panel: rgba(255,255,255,0.04);
+    --muted: rgba(220,220,255,0.35);
+    --accent: #00ffd5;
+    --accent2: #8b5cff;
+  }
+  html,body{height:100%; margin:0; font-family:Inter,system-ui,Arial; background:var(--bg); color:#dfeffe; -webkit-font-smoothing:antialiased;}
+  #wrap{display:flex; height:100vh; align-items:center; justify-content:center; padding:18px;}
+  canvas{display:block; border-radius:10px; background:linear-gradient(#070712, #05060a 60%); box-shadow:0 30px 80px rgba(0,0,0,0.7);}
+  #ui {
+    position: fixed; left:22px; top:22px; z-index:40; background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.02));
+    border:1px solid rgba(255,255,255,0.03); padding:12px; border-radius:10px; backdrop-filter: blur(6px); width:310px;
+  }
+  h1{margin:0;font-size:16px}
+  p.muted{color:var(--muted); margin:6px 0 0 0; font-size:13px}
+  .kbd{display:inline-block;background:rgba(255,255,255,0.03);padding:6px 8px;border-radius:6px;margin:6px 6px 0 0;font-weight:700;font-size:13px}
+  .row{display:flex; gap:8px; align-items:center; margin-top:8px}
+  button{background:var(--accent);border:0;color:#021; padding:8px 10px;border-radius:8px;font-weight:800; cursor:pointer}
+  #footer{position:fixed; right:20px; bottom:18px; color:var(--muted); font-size:13px}
+  .stat{font-size:14px; color:#cfefff; font-weight:700}
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>Pull & Shock — Facility Escape</h1>
+  <p class="muted">WASD to move. Mouse to aim. Hold Left Click to grapple an enemy in the aim direction. Hold <span class="kbd">Shift</span> while grappling to pull them to you instead. Press <span class="kbd">Space</span> when they're close to release a shockwave and slam them into walls. Loot drops on kill.</p>
+  <div class="row" style="margin-top:10px;">
+    <div class="stat" id="score">Score: 0</div>
+    <div style="flex:1"></div>
+    <button id="restart">Restart</button>
+  </div>
+  <div class="row">
+    <div class="kbd">W A S D</div><div class="kbd">Mouse</div><div class="kbd">LMB</div><div class="kbd">Shift</div><div class="kbd">Space</div>
+  </div>
+  <p class="muted" style="margin-top:8px"><strong>Depth:</strong> <span id="depth">1</span> &nbsp;&nbsp; <strong>Enemies:</strong> <span id="nEnemies">0</span></p>
+  <p class="muted" style="margin-top:6px">Tip: hold LMB to pull. Hold Shift to invert. Shockwave does more damage the closer they are; slam them into walls for kills.</p>
+</div>
+
+<div id="wrap">
+  <!-- We'll use two canvases: main + glow. Glow is blurred to fake bloom. -->
+  <canvas id="glow" width="1100" height="700" style="position:absolute; z-index:1; filter: blur(10px) saturate(120%); mix-blend-mode:screen; opacity:0.9;"></canvas>
+  <canvas id="main" width="1100" height="700" style="position:relative; z-index:2;"></canvas>
+</div>
+<div id="footer">Made for chaos. No refunds. 😈</div>
+
+<script>
+/* ----- PULL & SHOCK: single-file game ----- 
+   - Procedural facility: rooms (big) connected by straight hallways
+   - Player: WASD, mouse aim, grapple LMB locks to an enemy and pulls (or inverts with Shift)
+   - Shockwave (Space) when enemy close -> knockback; if enemy hits wall at high speed -> die -> loot drop
+   - Visual polish: glow canvas, particles, screen shake
+*/
+
+/* ------------------ Config & Tunables ------------------ */
+const CONFIG = {
+  canvasW: 1100, canvasH: 700,
+  worldPadding: 160,
+  roomCount: 9,     // number of rooms in procedural map (bigger -> larger map)
+  roomMinSize: 320,
+  roomMaxSize: 640,
+  corridorWidth: 90,
+  gravity: 2000,
+  player: {
+    radius: 14, mass: 1.0, maxSpeed: 660,
+    accel: 2600, dashImpulse: 450, dashRefire: 0.6
+  },
+  enemy: { minR: 14, maxR: 30, spawnPerRoom: 2 },
+  grapple: { speed: 2200, maxDist: 900, pullStrength: 5400, cooldown: 0.05 },
+  shockwave: { range: 140, baseImpulse: 1000, recharge: 0.18, killWallSpeed: 700 /*speed threshold on wall impact*/ },
+  loot: { pickupRange: 18, life: 18 } // life seconds
+};
+
+/* ------------------ Setup canvases ------------------ */
+const canvas = document.getElementById('main');
+const glow = document.getElementById('glow');
+const ctx = canvas.getContext('2d');
+const gctx = glow.getContext('2d');
+canvas.width = CONFIG.canvasW; canvas.height = CONFIG.canvasH;
+glow.width = CONFIG.canvasW; glow.height = CONFIG.canvasH;
+
+/* UI elements */
+const scoreEl = document.getElementById('score');
+const depthEl = document.getElementById('depth');
+const nEnemiesEl = document.getElementById('nEnemies');
+document.getElementById('restart').onclick = () => init(true);
+
+/* ------------------ Input ------------------ */
+const keys = {};
+let mouse = { x: 0, y: 0, down: false };
+let shiftHeld = false;
+window.addEventListener('keydown', e => { keys[e.key] = true; if (e.key === 'Shift') shiftHeld = true; });
+window.addEventListener('keyup', e => { keys[e.key] = false; if (e.key === 'Shift') shiftHeld = false; });
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - rect.left;
+  mouse.y = e.clientY - rect.top;
+});
+canvas.addEventListener('mousedown', e => { if (e.button === 0) mouse.down = true; });
+window.addEventListener('mouseup', e => { if (e.button === 0) mouse.down = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('blur', ()=>{ /*reset inputs on lost focus*/ for(let k in keys) keys[k]=false; mouse.down=false; shiftHeld=false; });
+
+/* ------------------ Math helpers ------------------ */
+function v(x=0,y=0){return {x,y};}
+function add(a,b){return {x:a.x+b.x,y:a.y+b.y};}
+function sub(a,b){return {x:a.x-b.x,y:a.y-b.y};}
+function mul(a,s){return {x:a.x*s,y:a.y*s};}
+function len(a){return Math.hypot(a.x,a.y);}
+function norm(a){ let L=len(a); return L?{x:a.x/L,y:a.y/L}:{x:0,y:0};}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function rand(a,b){return a + Math.random()*(b-a);}
+function randInt(a,b){return Math.floor(rand(a,b+1));}
+
+/* ------------------ World generation (rooms + corridors) ------------------ */
+let rooms = []; // {x,y,w,h,center}
+let corridors = []; // rectangles representing hallways
+let walls = []; // axis-aligned rectangles (x,y,w,h) of solid geometry
+
+function rectCenter(r){ return {x:r.x + r.w/2, y:r.y + r.h/2}; }
+
+function generateMap(seedDepth=1){
+  rooms = []; corridors = []; walls = [];
+  // create rooms distributed in a grid-ish space
+  const cols = Math.ceil(Math.sqrt(CONFIG.roomCount));
+  const rows = Math.ceil(CONFIG.roomCount / cols);
+  const gapX = (CONFIG.canvasW + CONFIG.worldPadding*2) / cols;
+  const gapY = (CONFIG.canvasH + CONFIG.worldPadding*2) / rows;
+  // place rooms
+  for (let i=0;i<CONFIG.roomCount;i++){
+    const cx = (i % cols) * gapX + rand(0.15,0.85) * gapX - CONFIG.worldPadding;
+    const cy = Math.floor(i / cols) * gapY + rand(0.15,0.85) * gapY - CONFIG.worldPadding;
+    const w = rand(CONFIG.roomMinSize, CONFIG.roomMaxSize);
+    const h = rand(CONFIG.roomMinSize, CONFIG.roomMaxSize);
+    const room = { x: cx - w/2, y: cy - h/2, w, h, center: {x:cx,y:cy} };
+    rooms.push(room);
+  }
+  // connect rooms in a minimal spanning tree-ish by sorting centers and connecting nearest
+  let connected = [rooms[0]];
+  let remaining = rooms.slice(1);
+  while (remaining.length){
+    let bestPair = null; let bestD=1e9;
+    for (let a of connected){
+      for (let i=0;i<remaining.length;i++){
+        const b = remaining[i];
+        const d = Math.hypot(a.center.x-b.center.x, a.center.y-b.center.y);
+        if (d < bestD){ bestD=d; bestPair=[a,b,i]; }
+      }
+    }
+    const a = bestPair[0], b = bestPair[1];
+    // create corridor rectangle between centers (L-shaped)
+    if (Math.random() < 0.5){
+      const mid = {x:b.center.x, y:a.center.y};
+      corridors.push(makeCorridor(a.center, mid, CONFIG.corridorWidth));
+      corridors.push(makeCorridor(mid, b.center, CONFIG.corridorWidth));
+    } else {
+      const mid = {x:a.center.x, y:b.center.y};
+      corridors.push(makeCorridor(a.center, mid, CONFIG.corridorWidth));
+      corridors.push(makeCorridor(mid, b.center, CONFIG.corridorWidth));
+    }
+    // mark connected
+    connected.push(b);
+    remaining.splice(bestPair[2],1);
+  }
+  // push room rects into walls as negative: we'll build walls outside room & corridor bounds
+  // Build world bounds large enough (we'll use implicit infinite walls beyond canvas)
+  // For ease, create solid wall rectangles from the complement of rooms+corridors in a bounding area
+  // We'll define bounding rect slightly bigger than canvas
+  const B = {x:-400, y:-400, w: canvas.width + 800, h: canvas.height + 800};
+  // Create mask of open spaces as union of rooms and corridors
+  const openRects = rooms.concat(corridors);
+  // Approach: subdivide B into grid and mark cells as wall if not inside any openRect
+  const cell = 40;
+  for (let gx=B.x; gx < B.x + B.w; gx += cell){
+    for (let gy=B.y; gy < B.y + B.h; gy += cell){
+      const cr = {x:gx, y:gy, w:cell, h:cell};
+      let inside = false;
+      for (let o of openRects){
+        if (rectIntersects(cr, o)) { inside = true; break; }
+      }
+      if (!inside){
+        walls.push(cr);
+      }
+    }
+  }
+  // optionally merge adjacent walls here (skipped for brevity)
+}
+
+function makeCorridor(a,b,width){
+  const x1 = Math.min(a.x, b.x), x2 = Math.max(a.x, b.x);
+  const y1 = Math.min(a.y, b.y), y2 = Math.max(a.y, b.y);
+  if (Math.abs(a.x - b.x) < 1){ // vertical
+    return { x: a.x - width/2, y: y1, w: width, h: y2 - y1, center: {x:a.x, y:(y1+y2)/2} };
+  } else if (Math.abs(a.y - b.y) < 1){ // horizontal
+    return { x: x1, y: a.y - width/2, w: x2 - x1, h: width, center: {x:(x1+x2)/2, y:a.y} };
+  } else {
+    // we won't use oblique corridors here — caller makes L-shapes
+    return { x: x1, y: y1, w: x2-x1, h: y2-y1, center: {x:(x1+x2)/2, y:(y1+y2)/2}};
+  }
+}
+
+function rectIntersects(a,b){
+  return !(a.x + a.w < b.x || b.x + b.w < a.x || a.y + a.h < b.y || b.y + b.h < a.y);
+}
+
+/* ------------------ Entities ------------------ */
+let player, enemies=[], projectiles=[], loot=[], particles=[];
+let grappleState = null; // {targetEnemy, tetherDist, grabbedAt} while mouse down
+let score = 0, depth = 1;
+
+/* Player entity */
+function spawnPlayer(){
+  // start in first room center
+  const r = rooms[0] || {center:{x: canvas.width/2, y: canvas.height/2}};
+  player = {
+    pos: {x: r.center.x, y: r.center.y},
+    vel: {x:0, y:0},
+    radius: CONFIG.player.radius,
+    mass: CONFIG.player.mass,
+    shockCd: 0,
+    dashCd: 0,
+    trail: []
+  };
+}
+
+/* Enemy entity */
+function spawnEnemies(){
+  enemies = [];
+  for (let i=0;i<rooms.length;i++){
+    const r = rooms[i];
+    const count = randInt(1, CONFIG.enemy.spawnPerRoom + (i===0?0:1));
+    for (let k=0;k<count;k++){
+      const x = clamp(rand(r.x + 40, r.x + r.w - 40), r.x+20, r.x+r.w-20);
+      const y = clamp(rand(r.y + 40, r.y + r.h - 40), r.y+20, r.y+r.h-20);
+      const rad = rand(CONFIG.enemy.minR, CONFIG.enemy.maxR);
+      enemies.push({
+        pos:{x,y}, vel:{x:rand(-40,40), y:rand(-20,20)}, radius:rad, mass: rad*0.08,
+        health: rad*2.6, dead:false, lastWallHitSpeed:0, color: '#00ffd5'
+      });
+    }
+  }
+}
+
+/* Loot */
+function spawnLoot(x,y, value=1){
+  loot.push({ pos:{x,y}, vel:{x:rand(-150,150), y:rand(-300,-60)}, life: CONFIG.loot.life, val: value, glow: rand(0.5,1.2) });
+}
+
+/* Particles */
+function spawnParticles(x,y, count, col='#fff', spread=180, speed=220){
+  for (let i=0;i<count;i++){
+    const ang = rand(0, Math.PI*2);
+    particles.push({
+      pos:{x,y},
+      vel:{x: Math.cos(ang)*rand(20,speed), y: Math.sin(ang)*rand(20,speed)},
+      life: rand(0.3,1.0),
+      col, size: rand(1.8,4.6)
+    });
+  }
+}
+
+/* ------------------ Collision helpers (AABB) ------------------ */
+function resolveWallsForCircle(ent){
+  // Move entity out of overlapping wall cells by iterative separation
+  for (let i=0;i<4;i++){
+    let overlapMin = 1e9;
+    let best = null;
+    for (let w of walls){
+      // check circle vs rect
+      const nearestX = clamp(ent.pos.x, w.x, w.x + w.w);
+      const nearestY = clamp(ent.pos.y, w.y, w.y + w.h);
+      const dx = ent.pos.x - nearestX;
+      const dy = ent.pos.y - nearestY;
+      const dist2 = dx*dx + dy*dy;
+      const r = ent.radius || 4;
+      if (dist2 < r*r - 0.001){
+        const dist = Math.sqrt(dist2) || 0.0001;
+        const pen = r - dist;
+        const nx = dx / dist, ny = dy / dist;
+        const sep = {x: nx * pen, y: ny * pen};
+        if (pen < overlapMin){ overlapMin = pen; best = {sep, w}; }
+      }
+    }
+    if (!best) break;
+    // separate entity
+    ent.pos.x += best.sep.x;
+    ent.pos.y += best.sep.y;
+    // reflect velocity a bit for physics feedback
+    ent.vel.x *= 0.6; ent.vel.y *= 0.6;
+    // record speed for potential kill if this was an enemy hitting a wall
+    if (ent._isEnemy){
+      ent.lastWallHitSpeed = Math.max(ent.lastWallHitSpeed, len(ent.vel));
+    }
+  }
+}
+
+/* ------------------ Grapple logic ------------------ */
+function beginGrapple(){
+  if (grappleState) return; // already grappling
+  // find target enemy in aim cone within maxDist and reasonably in front
+  const worldMouse = screenToWorld({x:mouse.x, y:mouse.y});
+  const aimDir = norm(sub(worldMouse, player.pos));
+  let best = null; let bestScore = 0;
+  for (let e of enemies){
+    if (e.dead) continue;
+    const toE = sub(e.pos, player.pos);
+    const d = len(toE);
+    if (d > CONFIG.grapple.maxDist) continue;
+    const a = Math.acos(clamp(dot(aimDir, norm(toE)), -1, 1));
+    // prefer closer + more aligned
+    const score = (1/(d+10)) * (1 / (a+0.01));
+    if (score > bestScore){
+      bestScore = score; best = e;
+    }
+  }
+  if (best){
+    // latch onto that enemy
+    grappleState = {
+      target: best,
+      tetherDist: len(sub(best.pos, player.pos)),
+      grabbedAt: performance.now()
+    };
+    // small particle / sound effect feel
+    spawnParticles(player.pos.x, player.pos.y, 10, '#8b5cff');
+  }
+}
+
+function releaseGrappleFling(){
+  if (!grappleState) return;
+  // fling impulse: if we are pulling them to us, fling target away; if pulling us to them, fling us
+  const g = grappleState;
+  const distNow = len(sub(g.target.pos, player.pos));
+  // small extra impulse based on tension
+  const tension = clamp((g.tetherDist - distNow) / Math.max(1, g.tetherDist), -1, 1);
+  if (shiftHeld){
+    // we were pulling enemy; fling enemy strongly away from player direction
+    const dir = norm(sub(g.target.pos, player.pos));
+    g.target.vel.x += dir.x * 820 * (1 + Math.abs(tension));
+    g.target.vel.y += dir.y * 820 * (1 + Math.abs(tension));
+    spawnParticles(g.target.pos.x, g.target.pos.y, 10, '#ff7b72');
+  } else {
+    // we were pulling player; fling player away from enemy
+    const dir = norm(sub(player.pos, g.target.pos));
+    player.vel.x += dir.x * 820 * (1 + Math.abs(tension));
+    player.vel.y += dir.y * 820 * (1 + Math.abs(tension));
+    spawnParticles(player.pos.x, player.pos.y, 10, '#00ffd5');
+  }
+  // short screen shake
+  cam.shake(12);
+  // clear
+  grappleState = null;
+}
+
+/* ------------------ Shockwave mechanic ------------------ */
+function doShockwave(){
+  if (player.shockCd > 0) return;
+  // shock centered on player; apply outward impulse to enemies within range
+  const range = CONFIG.shockwave.range;
+  let anyAffected = false;
+  for (let e of enemies){
+    if (e.dead) continue;
+    const d = len(sub(e.pos, player.pos));
+    if (d <= range + e.radius){
+      const strength = CONFIG.shockwave.baseImpulse * (1 - d / (range + 10));
+      const dir = norm(sub(e.pos, player.pos));
+      e.vel.x += dir.x * strength / e.mass;
+      e.vel.y += dir.y * strength / e.mass;
+      anyAffected = true;
+    }
+  }
+  if (anyAffected){
+    player.shockCd = CONFIG.shockwave.recharge;
+    spawnParticles(player.pos.x, player.pos.y, 26, '#ffffff', 260, 320);
+    cam.shake(10);
+  }
+}
+
+/* ------------------ World -> screen transform (camera) ------------------ */
+let camera = { x:0, y:0, shakeAmt:0 };
+function updateCamera(dt){
+  // follow player smoothly
+  const targetX = player.pos.x - canvas.width/2;
+  const targetY = player.pos.y - canvas.height/2;
+  camera.x += (targetX - camera.x) * clamp(dt*6, 0, 1);
+  camera.y += (targetY - camera.y) * clamp(dt*6, 0, 1);
+  // clamp camera roughly within generation bounds (we won't restrict too hard)
+}
+function screenToWorld(p){ return { x: p.x + camera.x, y: p.y + camera.y }; }
+function worldToScreen(p){ return { x: p.x - camera.x, y: p.y - camera.y }; }
+
+/* ------------------ Physics & update loop ------------------ */
+let lastTime = 0;
+function update(ts){
+  const dt = Math.min(1/30, (ts - lastTime)/1000 || 1/60);
+  lastTime = ts;
+  // Input: movement
+  const move = {x:0, y:0};
+  if (keys['w'] || keys['W'] || keys['ArrowUp']) move.y -= 1;
+  if (keys['s'] || keys['S'] || keys['ArrowDown']) move.y += 1;
+  if (keys['a'] || keys['A'] || keys['ArrowLeft']) move.x -= 1;
+  if (keys['d'] || keys['D'] || keys['ArrowRight']) move.x += 1;
+  if (len(move) > 0.001){
+    const mdir = norm(move);
+    player.vel.x += mdir.x * CONFIG.player.accel * dt / player.mass;
+    player.vel.y += mdir.y * CONFIG.player.accel * dt / player.mass;
+  }
+  // damping & cap
+  player.vel.x *= 0.995; player.vel.y *= 0.995;
+  if (len(player.vel) > CONFIG.player.maxSpeed){
+    const n = norm(player.vel);
+    player.vel = mul(n, CONFIG.player.maxSpeed);
+  }
+  // dash (optional: quick keyboard dash)
+  if ((keys[' '] || keys['Shift']) && player.dashCd <= 0){ /* we use space for shockwave, so skip auto dash */ }
+
+  // Grappling mechanics while holding mouse
+  if (mouse.down){
+    if (!grappleState) beginGrapple();
+  } else {
+    if (grappleState) {
+      // release fling when mouse up
+      releaseGrappleFling();
+    }
+  }
+
+  if (grappleState){
+    const g = grappleState;
+    const target = g.target;
+    // tether behavior: if shiftHeld -> we pull enemy toward player, else we pull player toward enemy
+    const toTarget = sub(target.pos, player.pos);
+    const dist = len(toTarget);
+    const dir = norm(toTarget);
+    const tension = clamp((dist - g.tetherDist) / (g.tetherDist || 1), -2, 2);
+    if (shiftHeld){
+      // pull enemy toward player
+      const pull = mul(norm(sub(player.pos, target.pos)), CONFIG.grapple.pullStrength * dt / target.mass);
+      target.vel.x += pull.x; target.vel.y += pull.y;
+      // tiny anchor to make tug feel strong
+      player.vel.x *= 0.995; player.vel.y *= 0.995;
+    } else {
+      // pull player toward enemy
+      const pull = mul(dir, CONFIG.grapple.pullStrength * dt / player.mass);
+      player.vel.x += pull.x; player.vel.y += pull.y;
+    }
+    // visual tether grows/shrinks
+    g.tetherDist = clamp(g.tetherDist * 0.995 + dist * 0.005, 8, CONFIG.grapple.maxDist);
+  }
+
+  // Shockwave (Space)
+  if (keys[' '] && player.shockCd <= 0){
+    // only allow shock if any enemy within a small trigger radius (gives player agency)
+    let canShock = false;
+    for (let e of enemies){ if (!e.dead && len(sub(e.pos, player.pos)) < CONFIG.shockwave.range + 30) { canShock = true; break; } }
+    if (canShock) doShockwave();
+  }
+
+  // integrate physics
+  player.vel.y += CONFIG.gravity * dt * 0.01; // tiny simulated gravity in top-down for 'weight'
+  player.pos.x += player.vel.x * dt; player.pos.y += player.vel.y * dt;
+  // player-wall collision
+  resolveWallsForCircle(player);
+
+  // enemies update
+  for (let e of enemies){
+    if (e.dead) {
+      // corpse physics: fall & slow down
+      e.vel.y += CONFIG.gravity * dt * 0.02;
+      e.pos.x += e.vel.x * dt; e.pos.y += e.vel.y * dt;
+    } else {
+      // small AI: wander, sometimes push toward player if close
+      e.pos.x += e.vel.x * dt; e.pos.y += e.vel.y * dt;
+      // simple separation
+      for (let o of enemies){
+        if (o === e) continue;
+        const d = len(sub(o.pos, e.pos));
+        if (d > 0 && d < e.radius + o.radius){
+          const n = norm(sub(e.pos, o.pos));
+          const push = mul(n, (e.radius + o.radius - d) * 0.6);
+          e.pos.x += push.x * dt * 12;
+          e.pos.y += push.y * dt * 12;
+        }
+      }
+      // slight homing if near player to make fights interactive
+      const toPlayer = sub(player.pos, e.pos);
+      if (len(toPlayer) < 380 && Math.random() < 0.02){
+        e.vel.x += norm(toPlayer).x * 60;
+        e.vel.y += norm(toPlayer).y * 60;
+      }
+    }
+    // wall resolution & record wall hit speeds
+    resolveWallsForCircle(e);
+    // if enemy hit wall fast enough, kill them
+    if (!e.dead && e.lastWallHitSpeed > CONFIG.shockwave.killWallSpeed){
+      // enemy eliminated
+      e.dead = true;
+      spawnParticles(e.pos.x, e.pos.y, 20, '#ff7b72');
+      cam.shake(10);
+      // spawn loot
+      const nLoot = randInt(1, 3);
+      for (let i=0;i<nLoot;i++) spawnLoot(e.pos.x + rand(-8,8), e.pos.y + rand(-8,8), randInt(1,3));
+      score += 80;
+    }
+    // clamp lastWallHitSpeed decay
+    e.lastWallHitSpeed = Math.max(0, e.lastWallHitSpeed - 60*dt);
+  }
+
+  // projectiles (not used heavily here, but leave framework)
+  for (let p of projectiles){
+    p.pos.x += p.vel.x * dt; p.pos.y += p.vel.y * dt;
+    resolveWallsForCircle(p);
+  }
+
+  // loot update & pickup
+  for (let i=loot.length-1;i>=0;i--){
+    const L = loot[i];
+    L.vel.y += CONFIG.gravity * dt * 0.02;
+    L.pos.x += L.vel.x * dt; L.pos.y += L.vel.y * dt;
+    L.life -= dt;
+    resolveWallsForCircle(L);
+    if (len(sub(L.pos, player.pos)) < CONFIG.loot.pickupRange){
+      score += L.val * 10;
+      spawnParticles(L.pos.x, L.pos.y, 8, '#ffd47a');
+      loot.splice(i,1);
+    } else if (L.life <= 0){
+      loot.splice(i,1);
+    }
+  }
+
+  // particles update
+  for (let i=particles.length-1;i>=0;i--){
+    const p = particles[i];
+    p.vel.y += 900 * dt;
+    p.pos.x += p.vel.x * dt; p.pos.y += p.vel.y * dt;
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i,1);
+  }
+
+  // screen camera update
+  updateCamera(dt);
+
+  // periodic spawns or depth handling (simple): if most enemies cleared, advance depth and regen next rooms
+  const alive = enemies.filter(e=>!e.dead).length;
+  if (alive <= Math.max(0, Math.floor(enemies.length * 0.2))){
+    // small delay then next depth
+    depth += 1;
+    depthEl.textContent = depth;
+    // increase difficulty by adding more enemies next gen
+    CONFIG.roomCount = clamp(CONFIG.roomCount + 1, 7, 16);
+    // regenerate map & respawn player roughly in new starting room
+    generateMap();
+    spawnPlayer();
+    spawnEnemies();
+  }
+
+  // update HUD
+  scoreEl.textContent = 'Score: ' + Math.floor(score);
+  nEnemiesEl.textContent = enemies.filter(e=>!e.dead).length;
+
+  // draw
+  render();
+
+  // loop
+  requestAnimationFrame(update);
+}
+
+/* ------------------ Camera shake helper ------------------ */
+const cam = {
+  shakeAmt: 0,
+  shake(dt){ this.shakeAmt = Math.max(this.shakeAmt, dt); },
+  shakeDecay(){ this.shakeAmt *= 0.92; if (this.shakeAmt < 0.1) this.shakeAmt = 0; }
+};
+
+/* connect cam helper to external */
+function camShake(v){ cam.shake(v); }
+
+/* ------------------ Rendering ------------------ */
+function clearBoth(){
+  ctx.clearRect(0,0,canvas.width, canvas.height);
+  gctx.clearRect(0,0,glow.width, glow.height);
+}
+
+function render(){
+  clearBoth();
+  // apply camera shake offset
+  const sx = camera.x + (Math.random()-0.5) * cam.shakeAmt*2;
+  const sy = camera.y + (Math.random()-0.5) * cam.shakeAmt*2;
+
+  // draw glow layer (only bright things)
+  // rooms glow: floor lights
+  for (let r of rooms){
+    const s = worldToScreen({x:r.x, y:r.y});
+    gctx.fillStyle = 'rgba(12,255,210,0.045)';
+    gctx.fillRect(s.x, s.y, r.w, r.h);
+  }
+  for (let c of corridors){
+    const s = worldToScreen({x:c.x, y:c.y});
+    gctx.fillStyle = 'rgba(140,92,255,0.03)';
+    gctx.fillRect(s.x, s.y, c.w, c.h);
+  }
+
+  // draw loot glow
+  for (let L of loot){
+    const s = worldToScreen(L.pos);
+    const g = Math.sin(performance.now()/200 + L.glow)*0.5 + 0.5;
+    gctx.beginPath();
+    gctx.fillStyle = `rgba(255,215,120,${0.6 * g})`;
+    gctx.arc(s.x, s.y, 10 + g*6, 0, Math.PI*2);
+    gctx.fill();
+  }
+
+  // draw enemies glow
+  for (let e of enemies){
+    const s = worldToScreen(e.pos);
+    if (!e.dead){
+      gctx.beginPath();
+      gctx.fillStyle = 'rgba(0,255,213,0.18)';
+      gctx.arc(s.x, s.y, e.radius*1.8, 0, Math.PI*2);
+      gctx.fill();
+    } else {
+      gctx.beginPath();
+      gctx.fillStyle = 'rgba(255,123,114,0.12)';
+      gctx.arc(s.x, s.y, e.radius*2.2, 0, Math.PI*2);
+      gctx.fill();
+    }
+  }
+
+  // MAIN: draw world base
+  // floor
+  ctx.fillStyle = '#05060a'; ctx.fillRect(0,0,canvas.width, canvas.height);
+
+  // draw rooms (floor tiles)
+  for (let r of rooms){
+    const s = worldToScreen({x:r.x, y:r.y});
+    ctx.fillStyle = '#0b0f17'; ctx.fillRect(s.x, s.y, r.w, r.h);
+    // subtle border
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+    ctx.strokeRect(s.x+0.5, s.y+0.5, r.w-1, r.h-1);
+  }
+  // corridors
+  for (let c of corridors){
+    const s = worldToScreen({x:c.x, y:c.y});
+    ctx.fillStyle = '#0a0d13'; ctx.fillRect(s.x, s.y, c.w, c.h);
+  }
+
+  // walls (solid blocks)
+  ctx.fillStyle = '#040507';
+  for (let w of walls){
+    const s = worldToScreen({x:w.x, y:w.y});
+    ctx.fillRect(s.x, s.y, w.w, w.h);
+  }
+
+  // draw loot (main)
+  for (let L of loot){
+    const s = worldToScreen(L.pos);
+    // core
+    ctx.beginPath();
+    ctx.fillStyle = '#ffd47a';
+    ctx.arc(s.x, s.y, 6, 0, Math.PI*2);
+    ctx.fill();
+    // rim
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 2; ctx.stroke();
+  }
+
+  // draw enemies (main)
+  for (let e of enemies){
+    const s = worldToScreen(e.pos);
+    ctx.beginPath();
+    ctx.fillStyle = e.dead ? '#6b6f78' : '#00ffd5';
+    ctx.arc(s.x, s.y, e.radius, 0, Math.PI*2);
+    ctx.fill();
+    // outline
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 1; ctx.stroke();
+    // small eye / detail
+    if (!e.dead){
+      ctx.beginPath();
+      ctx.fillStyle = '#001e1a';
+      ctx.arc(s.x + e.radius*0.35, s.y - e.radius*0.15, Math.max(1, e.radius*0.3), 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  // tether (grapple) visual
+  if (grappleState){
+    const g = grappleState;
+    const tpos = worldToScreen(g.target.pos);
+    const ppos = worldToScreen(player.pos);
+    // line
+    ctx.beginPath();
+    ctx.moveTo(ppos.x, ppos.y);
+    ctx.lineTo(tpos.x, tpos.y);
+    ctx.strokeStyle = shiftHeld ? 'rgba(255,110,150,0.9)' : 'rgba(0,255,213,0.9)';
+    ctx.lineWidth = 2.4; ctx.stroke();
+    // hook dot
+    ctx.beginPath(); ctx.fillStyle = shiftHeld ? '#ff6f8b' : '#00ffd5'; ctx.arc(tpos.x, tpos.y, 6, 0, Math.PI*2); ctx.fill();
+  }
+
+  // draw player (main)
+  const sp = worldToScreen(player.pos);
+  // trail
+  player.trail.unshift({x:player.pos.x, y:player.pos.y, life:0.24});
+  if (player.trail.length > 12) player.trail.pop();
+  for (let i=player.trail.length-1;i>=0;i--){
+    const t = player.trail[i];
+    const s = worldToScreen(t);
+    ctx.fillStyle = `rgba(0,255,213,${0.06 + i/player.trail.length*0.12})`;
+    ctx.fillRect(s.x-6, s.y-6, 12, 12);
+    t.life -= 0.016;
+    if (t.life <= 0) player.trail.splice(i,1);
+  }
+  // ship body (triangle)
+  ctx.save();
+  ctx.translate(sp.x, sp.y);
+  const aim = norm(sub(screenToWorld({x:mouse.x,y:mouse.y}), player.pos));
+  const ang = Math.atan2(aim.y, aim.x);
+  ctx.rotate(ang + Math.PI/2);
+  ctx.beginPath();
+  ctx.moveTo(0, -player.radius - 4);
+  ctx.lineTo(player.radius*0.7, player.radius+6);
+  ctx.lineTo(-player.radius*0.7, player.radius+6);
+  ctx.closePath();
+  ctx.fillStyle = '#eafcff'; ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 1; ctx.stroke();
+  // cockpit
+  ctx.beginPath(); ctx.fillStyle = '#001f22'; ctx.arc(0, -2, player.radius*0.45, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+
+  // particles
+  for (let p of particles){
+    const s = worldToScreen(p.pos);
+    ctx.fillStyle = p.col;
+    ctx.fillRect(s.x - p.size/2, s.y - p.size/2, p.size, p.size);
+  }
+
+  // overlay HUD reticle
+  const mWorld = screenToWorld({x:mouse.x, y:mouse.y});
+  const aimScreen = {x: mouse.x, y: mouse.y};
+  ctx.beginPath();
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 2;
+  ctx.arc(aimScreen.x, aimScreen.y, 8, 0, Math.PI*2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.strokeStyle = 'rgba(0,255,213,0.65)'; ctx.lineWidth = 1; ctx.arc(aimScreen.x, aimScreen.y, 4, 0, Math.PI*2); ctx.stroke();
+
+  // draw glow onto main with blending (cheap bloom)
+  // copy glow canvas with globalCompositeOperation 'screen' handled by CSS mix-blend-mode screen
+  // we don't need to composite here.
+
+  // reduce camera shake gradually
+  cam.shakeDecay();
+  camera.x += (Math.random()-0.5) * cam.shakeAmt;
+  camera.y += (Math.random()-0.5) * cam.shakeAmt;
+}
+
+/* ------------------ Utility dot ------------------ */
+function dot(a,b){ return a.x*b.x + a.y*b.y; }
+
+/* ------------------ Screen/world helpers ------------------ */
+function worldToScreen(pt){ return { x: pt.x - camera.x, y: pt.y - camera.y }; }
+function screenToWorld(pt){ return { x: pt.x + camera.x, y: pt.y + camera.y }; }
+
+/* ------------------ Init & start ------------------ */
+function init(restart=false){
+  // reset
+  rooms = []; corridors = []; walls = [];
+  generateMap();
+  spawnPlayer();
+  spawnEnemies();
+  projectiles = []; loot = []; particles = [];
+  grappleState = null;
+  score = 0; depth = 1;
+  depthEl.textContent = depth;
+  lastTime = performance.now();
+  // start loop
+  requestAnimationFrame(update);
+}
+init();
+
+/* ------------------ Input-handled release & shock events ------------------ */
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    // shockwave handled in update loop but prevent default scroll
+    e.preventDefault();
+  }
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space') {} 
+});
+canvas.addEventListener('mouseup', e => {
+  if (e.button === 0){
+    // left click release already handled in update loop; but also ensure fling occurs
+    // done via mouse.down toggling, so nothing extra needed
+  }
+});
+
+/* ------------------ Small polish: periodically tidy enemy velocities to avoid explosion ------------------ */
+setInterval(()=>{
+  for (let e of enemies){
+    if (len(e.vel) > 1500) { e.vel = mul(norm(e.vel), 1500); }
+  }
+  for (let p of projectiles){ if (len(p.vel) > 2200) p.vel = mul(norm(p.vel), 2200); }
+}, 1000);
+
+/* ------------------ Helper: dot product for aim tests ------------------ */
+function dot(a,b){ return a.x*b.x + a.y*b.y; }
+
+/* ------------------ Minor debug toggles (not shown) ------------------ */
+window.game = { spawnLoot, spawnEnemies, rooms, walls, enemies, player };
+
+/* ------------------ End of file ------------------ */
+</script>
+</body>
+</html>
